@@ -1,4 +1,9 @@
-use std::process::{Child, Command, Stdio};
+use std::{
+    io::{self, BufRead, BufReader},
+    process::{Child, Command, Stdio},
+    sync::mpsc,
+    thread,
+};
 
 use anyhow::Context;
 use ratatui::{
@@ -15,12 +20,19 @@ enum Mode {
         url: String,
         child: Child,
         percent: f64,
+        rx: mpsc::Receiver<Update>,
     },
 }
 
 struct App {
     mode: Mode,
     quit: bool,
+}
+
+enum Update {
+    Progress { percent: f64 },
+    Output { text: String },
+    Finished,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -59,15 +71,33 @@ fn run(mut terminal: DefaultTerminal, mut app: App) -> anyhow::Result<()> {
                         input.pop();
                     }
                     KeyCode::Enter => {
+                        let mut child = Command::new("ls")
+                            .arg("-lh")
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::null())
+                            .spawn()?;
+                        let child_stdout =
+                            child.stdout.take().expect("the stdout must not be empty");
+                        let reader = BufReader::new(child_stdout);
+                        let (tx, rx) = mpsc::channel();
+                        thread::spawn(move || {
+                            for line in reader.lines() {
+                                let Ok(line) = line else {
+                                    break;
+                                };
+                                if tx.send(Update::Output { text: line }).is_err() {
+                                    break;
+                                };
+                                rx.try_recv();
+                            }
+                            let _ = tx.send(Update::Finished);
+                        });
                         app.mode = Mode::Downloading {
                             url: std::mem::take(input),
-                            child: Command::new("ls")
-                                .arg("-lh")
-                                .stdout(Stdio::piped())
-                                .stderr(Stdio::piped())
-                                .spawn()?,
+                            child,
                             percent: 0_f64,
-                        }
+                            rx,
+                        };
                     }
                     _ => (),
                 },
